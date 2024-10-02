@@ -1,0 +1,15 @@
+# Ignore all files in figures, logs, results, true, .venv, and venv directories
+figures/
+logs/
+results/
+true/
+.venv/
+venv/
+
+# Optionally, ignore hidden files in these directories too
+figures/**
+logs/**
+results/**
+true/**
+.venv/**
+venv/**
