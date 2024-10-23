@@ -3,6 +3,7 @@ import pytorch_lightning as pl
 import torch.nn as nn
 from torch import optim
 import torch.nn.functional as F
+import torch.distributions as dist
 import torch
 from helpers import *
 
@@ -82,30 +83,30 @@ class GumbelSampler(pl.LightningModule):
         self.temperature = temperature
         self.temperature_decay = decay
 
-    def forward(self, pi, return_effects=True):
+    def forward(self, probs, return_effects=True):
         """
         forward pass
         :param log_pi: NxM tensor of log probabilities where N is the batch size and M is the number of classes
         :return: NxM tensor of 'discretized probabilities' the lowe the temperature the more discrete
         """
-        pi=pi.clamp(.001, .999)
 
-        log_pi = torch.cat((pi.log().unsqueeze(2), (1-pi).log().unsqueeze(2)), dim=2)
-        g = self.G.sample(log_pi.shape)
-
-        # sample from gumbel softmax
-        exponent = (log_pi + g) / self.temperature
-        attributes = self.softmax(exponent)
+        #pi = pi.clamp(0.001, 0.999)
+        #pi = torch.cat((pi.unsqueeze(2), (1 - pi).unsqueeze(2)), dim=2)
 
 
-        attributes = attributes[:, :, 0]
+        # Define the temperature for the RelaxedOneHotCategorical
+        temperature = self.temperature
 
+        # Create the RelaxedOneHotCategorical distribution
+        #print(temperature)
 
-        if return_effects:
-            effects = expand_interactions(attributes)
-            return effects
-        else:
-            return attributes
+        distribution = dist.RelaxedOneHotCategorical(temperature, probs=probs)
+        #print(torch.round(distribution.rsample(), decimals=2))
+        # Sample from the distribution
+        attributes = distribution.rsample()
+        #attributes = attributes[:, :, 0]
+
+        return attributes
 
 
 
@@ -189,7 +190,7 @@ class Encoder(pl.LightningModule):
 
         self.dense1 = nn.Linear(n_items, hidden_layer_size)
         self.dense2 = nn.Linear(hidden_layer_size, hidden_layer_size)
-        self.dense3 = nn.Linear(hidden_layer_size, n_attributes)
+        self.dense3 = nn.Linear(hidden_layer_size, n_attributes*2) # multiply by tow for two options (0 or 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -200,10 +201,16 @@ class Encoder(pl.LightningModule):
         """
 
         # calculate s and mu based on encoder weights
+
+
         x = F.elu(self.dense1(x))
         x = F.elu(self.dense2(x))
-        x = F.sigmoid(self.dense3(x))
-        return x
+        x = self.dense3(x)
+
+        log_pi = x.reshape((x.shape[0], x.shape[1]//2,2)).exp()
+
+
+        return log_pi # F.sigmoid(x)
 
 
 class GDINADecoder(pl.LightningModule):
@@ -240,7 +247,7 @@ class GDINADecoder(pl.LightningModule):
 
 class GDINA(pl.LightningModule):
     def __init__(self, n_items, n_attributes, dataloader, Q, learning_rate,
-                 temperature, decay, link, min_temp, LR_min, T_max, LR_warmup):
+                 temperature, decay, link, min_temp, LR_min, T_max, LR_warmup, n_iw_samples):
         super(GDINA, self).__init__()
         self.n_attributes = n_attributes
         self.n_items = n_items
@@ -259,40 +266,105 @@ class GDINA(pl.LightningModule):
         self.T_max = T_max
         self.LR_warmup = LR_warmup
 
+        self.n_samples = n_iw_samples
+
+
+
 
 
     def forward(self, X):
-
-        pi = self.encoder(X)
-        z = self.sampler(pi)
-
-        x_hat = self.decoder(z)
+        logits = self.encoder(X)
+        logits = logits.repeat(self.n_samples, 1, 1,1)
+        probs = F.softmax(logits, dim=-1)
 
 
-        return x_hat, pi
+        att = self.sampler(probs)
+        att = att / att.sum(-1, keepdim=True) # make sure probabilities sum to one (sometimes not true due to numerical issues)
+        att = att.clamp(1e-5, 1-1e-5)
 
-    def training_step(self, batch):
-        X_hat, pi = self(batch)
-        bce = torch.nn.functional.binary_cross_entropy(X_hat, batch, reduction='none')
-        bce = torch.mean(bce) * self.n_items
+        eff = expand_interactions(att[:, :,:, 0])
+
+
+        x_hat = self.decoder(eff)
+        pi = F.softmax(logits, dim=-1)
+
+
+
+
+
+        # logits = self.encoder(X)
+        # #logits = logits.repeat(self.n_samples, 1, 1, 1)
+        #
+        # probs = F.softmax(logits, dim=-1)
+        # probs = probs.repeat(self.n_samples, 1, 1, 1)
+        #
+        # eff_probs = expand_interactions(probs[:, :, :, 0]).clamp(1e-5, 1-1e-5)
+        #
+        #
+        # eff = self.sampler(eff_probs)
+        #
+        # eff = eff.clamp(1e-5, 1 - 1e-5)
+        #
+        # x_hat = self.decoder(eff)
+        #
+        #
+        # pi = torch.cat((eff_probs.unsqueeze(-1), 1-eff_probs.unsqueeze(-1)), dim=-1)
+        # eff = torch.cat((eff.unsqueeze(-1), 1-eff.unsqueeze(-1)), dim=-1)
+
+
+        return x_hat, pi, att
+
+    def loss(self, X_hat, z, pi, batch):
+        #bce = torch.nn.functional.binary_cross_entropy(X_hat, batch, reduction='none')
+        lll = ((batch * X_hat).clamp(1e-7).log() + ((1 - batch) * (1 - X_hat)).clamp(1e-7).log()).sum(-1, keepdim=True)
+        #bce = torch.mean(bce) * self.n_items
 
         # Compute the KL divergence for each attribute
-        pi = pi.clamp(0.0001, 0.9999)
-        kl_per_attribute = pi * torch.log(pi / 0.5) + (1 - pi) * torch.log((1 - pi) / 0.5)
+        #pi = pi.clamp(0.0001, 0.9999)
 
-        # Sum over the attributes for each instance in the batch
-        kl = kl_per_attribute.sum(dim=1)
 
-        # Take the mean over the batch
-        kl = torch.mean(kl)
+        kl_type = 'concrete'
+        if kl_type == 'categorical':
 
-        kl_div = pi * torch.log(pi / 0.5) + (1 - pi) * torch.log((1 - pi) / 0.5)
+            bce = torch.nn.functional.binary_cross_entropy(X_hat.squeeze(), batch, reduction='none')
+            bce = torch.mean(bce) * self.n_items
+            # Analytical KL based on categorical distribution
+            kl_div = pi * torch.log(pi / 0.5) + (1 - pi) * torch.log((1 - pi) / 0.5)
 
-        # Sum KL divergence over the latent variables (dimension K) and average over the batch
-        kl_div = torch.sum(kl_div, dim=1)  # Sum over K latent variables
-        kl_div = torch.mean(kl_div)  # Mean over the batch
+            # Sum KL divergence over the latent variables (dimension K) and average over the batch
+            kl_div = torch.sum(kl_div, dim=1)  # Sum over K latent variables
+            kl_div = torch.mean(kl_div)  # Mean over the batch
 
-        loss = bce + kl_div
+            loss = (bce + kl_div)
+        elif kl_type == 'concrete':
+
+            log_p_theta = dist.RelaxedOneHotCategorical(torch.Tensor([self.sampler.temperature]),
+                                                        probs=torch.ones_like(pi)).log_prob(z).sum(-1)
+            log_q_theta_x = dist.RelaxedOneHotCategorical(torch.Tensor([self.sampler.temperature]),
+                                                          probs=pi).log_prob(z).sum(-1)
+
+
+            kl = (log_q_theta_x - log_p_theta).unsqueeze(-1)  # kl divergence
+            # prior = dist.RelaxedOneHotCategorical(torch.Tensor([self.sampler.temperature]), probs=torch.ones_like(pi))
+            # z_dist = dist.RelaxedOneHotCategorical(torch.Tensor([self.sampler.temperature]), probs=pi)
+            #
+            # kl_div = (z_dist.log_prob(z) - prior.log_prob(z)).sum()
+
+
+            #loss = lll + kl_div
+            elbo = lll - kl
+
+            with torch.no_grad():
+                weight = (elbo - elbo.logsumexp(dim=0)).exp()
+            #
+            loss = (-weight * elbo).sum(0).mean()
+
+        return loss, weight
+
+    def training_step(self, batch):
+        X_hat, pi, att = self(batch)
+        loss, _ = self.loss(X_hat, att, pi, batch)
+
         self.log('train_loss', loss)
         self.log('lr', self.trainer.optimizers[0].param_groups[0]['lr'])
 
@@ -339,3 +411,38 @@ class GDINA(pl.LightningModule):
 
     def on_train_epoch_end(self):
         self.sampler.temperature = max(self.sampler.temperature * self.sampler.temperature_decay, self.min_temp)
+
+    def fscores(self, batch, n_mc_samples=50):
+        data = batch
+
+        if self.n_samples == 1:
+            mu, _ = self.encoder(data)
+            return mu.unsqueeze(0)
+        else:
+
+            scores = torch.empty((n_mc_samples, data.shape[0], self.n_attributes))
+            for i in range(n_mc_samples):
+
+                reco, pi, z = self(data)
+
+                loss, weight = self.loss(reco, z, pi, data)
+                z = z[:, :, :, 0]
+
+                idxs = torch.distributions.Categorical(probs=weight.permute(1, 2, 0)).sample()
+
+                # Reshape idxs to match the dimensions required by gather
+                # Ensure idxs is of the correct type
+                idxs = idxs.long()
+
+                # Expand idxs to match the dimensions required for gather
+                idxs_expanded = idxs.unsqueeze(-1).expand(-1, -1, z.size(2))  # Shape [10000, 1, 3]
+
+
+                # Use gather to select the appropriate elements from z
+                output = torch.gather(z.transpose(0, 1), 1,
+                                      idxs_expanded).squeeze().detach()  # Shape [10000, latent dims]
+                if self.n_attributes == 1:
+                    output = output.unsqueeze(-1)
+                scores[i, :, :] = output
+
+            return scores

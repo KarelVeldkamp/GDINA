@@ -30,15 +30,15 @@ if len(sys.argv) > 1:
 
 
 
-delta = torch.Tensor(pd.read_csv(f'true/parameters/delta_{cfg["which_data"]}.csv', index_col=0).values)
-intercepts = torch.Tensor(pd.read_csv(f'true/parameters/intercepts_{cfg["which_data"]}.csv', index_col=0).values).T
+delta = torch.Tensor(pd.read_csv(f'true/parameters/delta_{cfg["iteration"]}_{cfg["which_data"]}.csv', index_col=0).values)
+intercepts = torch.Tensor(pd.read_csv(f'true/parameters/intercepts_{cfg["iteration"]}_{cfg["which_data"]}.csv', index_col=0).values).T
 
 Q = (delta != 0).int()
 
 
-attributes = torch.Tensor(pd.read_csv(f'true/parameters/att_{cfg["which_data"]}.csv', index_col=0).values)
+attributes = torch.Tensor(pd.read_csv(f'true/parameters/att_{cfg["iteration"]}_{cfg["which_data"]}.csv', index_col=0).values)
 
-data = torch.Tensor(pd.read_csv(f'true/data/data_{cfg["which_data"]}.csv', index_col=0).values)
+data = torch.Tensor(pd.read_csv(f'true/data/data_{cfg["iteration"]}_{cfg["which_data"]}.csv', index_col=0).values)
 n_items = data.shape[1]
 n_attributes = int(np.log2(Q.shape[1]+1))
 
@@ -71,7 +71,8 @@ model = GDINA(dataloader=train_loader,
              min_temp=cfg['gumbel_min_temp'],
              T_max = cfg['lr_max_epochs'],
              LR_min= cfg['lr_min'],
-             LR_warmup=cfg['lr_warmup_epochs']
+             LR_warmup=cfg['lr_warmup_epochs'],
+             n_iw_samples=cfg['n_iw_samples']
              )
 
 
@@ -91,7 +92,7 @@ trainer = Trainer(fast_dev_run=cfg['single_epoch_test_run'],
                   EarlyStopping(monitor='train_loss', min_delta=cfg['min_delta'], patience=cfg['patience'],
                                 mode='min')],
                   accelerator=device.type,
-                  detect_anomaly=True)
+                  detect_anomaly=False)
 start = time.time()
 
 trainer.fit(model)
@@ -102,17 +103,24 @@ print(f'runtime: {runtime}')
 # compute the estimated conditional probabilities and the posterior probabilities on the test data
 test_data = next(iter(test_loader))
 
+
 #pred_class = (model.encoder(test_data) > .5).float().detach().numpy()
-pred_class = np.rint(model.sampler(model.encoder(test_data), return_effects=False).detach().numpy())
+pred_class = (model.fscores(test_data).mean(0) > .5).float().detach().numpy()
+
+print(expand_interactions(model.fscores(test_data).mean(0)).mean(1))
+print(np.rint(expand_interactions(model.fscores(test_data).mean(0))).mean(1))
+
 
 print(f'temperature: {model.sampler.temperature}')
 
 
-attributes = attributes.detach().numpy()
-print(model.sampler(model.encoder(test_data), return_effects=False))
 
-acc = (attributes==pred_class).mean()
-print(f'acc: {acc}')
+#acc = (expand_interactions(attributes).detach().numpy()==pred_class).mean()
+acc = (attributes.detach().numpy()==pred_class).mean()
+
+print(f'accruracy: {acc}')
+
+
 
 
 est_delta = (model.decoder.log_delta * model.decoder.Q).detach().numpy()

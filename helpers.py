@@ -23,6 +23,36 @@ def MSE(est, true):
 # returns: BxS tensor where S = 2^A-1
 
 def expand_interactions(attributes):
+    # make sure the attributes have 3 dimensions (IW samples, batch size, n_attributes)
+    if len(attributes.shape) == 2:
+        attributes = attributes.unsqueeze(0)
+
+    n_iw_samples = attributes.shape[0]
+    n_attributes = attributes.shape[2]
+    n_effects = 2**n_attributes-1
+    batch_size = attributes.shape[1]
+
+
+    # Generate SxA matrix where each row represents whether each attribute is needed for each effect
+    required_mask = torch.arange(1, n_effects + 1).unsqueeze(1).bitwise_and(1 << torch.arange(n_attributes)).bool()
+
+    # repeat the matrix for each IW sample and each observation
+    required_mask = required_mask.repeat((n_iw_samples, batch_size, 1, 1))  # IWxBxSxA
+
+    # repeat the observed attribute pattern for each possible combination
+    attributes = attributes.unsqueeze(2).repeat(1, 1, n_effects, 1)
+
+    # set the observed attributes to 1 if they are not required for a pattern
+    attributes[~required_mask] = 1
+
+    # multiply over the diffent attributes, so that we get the probability of observing all necessary attributes
+    effects = attributes.prod(3)
+
+
+    return effects
+
+
+def expand_interactions_old(attributes):
     n_attributes = attributes.shape[1]
     n_effects = 2**n_attributes-1
     batch_size = attributes.shape[0]
@@ -43,7 +73,6 @@ def expand_interactions(attributes):
     effects = attributes.prod(2)
 
     return effects
-
 
 def Cor(x, y):
     """Correlate each n with each m.
