@@ -77,11 +77,10 @@ class GumbelSampler(pl.LightningModule):
         """
         super(GumbelSampler, self).__init__()
         # Gumbel distribution
-
-        self.G = torch.distributions.Gumbel(0, 1)
         self.softmax = torch.nn.Softmax(dim=2)
         self.temperature = temperature
         self.temperature_decay = decay
+        self.sample = True
 
     def forward(self, probs, return_effects=True):
         """
@@ -90,21 +89,17 @@ class GumbelSampler(pl.LightningModule):
         :return: NxM tensor of 'discretized probabilities' the lowe the temperature the more discrete
         """
 
-        #pi = pi.clamp(0.001, 0.999)
-        #pi = torch.cat((pi.unsqueeze(2), (1 - pi).unsqueeze(2)), dim=2)
-
-
         # Define the temperature for the RelaxedOneHotCategorical
         temperature = self.temperature
 
         # Create the RelaxedOneHotCategorical distribution
-        #print(temperature)
-
         distribution = dist.RelaxedOneHotCategorical(temperature, probs=probs)
-        #print(torch.round(distribution.rsample(), decimals=2))
+
         # Sample from the distribution
-        attributes = distribution.rsample()
-        #attributes = attributes[:, :, 0]
+        if self.sample:
+            attributes = distribution.rsample()
+        else:
+            attributes = torch.round(probs)
 
         return attributes
 
@@ -188,9 +183,9 @@ class Encoder(pl.LightningModule):
         """
         super(Encoder, self).__init__()
 
-        self.dense1 = nn.Linear(n_items, hidden_layer_size)
-        self.dense2 = nn.Linear(hidden_layer_size, hidden_layer_size)
-        self.dense3 = nn.Linear(hidden_layer_size, n_attributes*2) # multiply by tow for two options (0 or 1)
+        self.dense1 = nn.Linear(n_items, n_attributes*2)
+        self.dense2 = nn.Linear(n_attributes*2, n_attributes*2)
+       # self.dense3 = nn.Linear(hidden_layer_size, n_attributes*2) # multiply by tow for two options (0 or 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -204,8 +199,7 @@ class Encoder(pl.LightningModule):
 
 
         x = F.elu(self.dense1(x))
-        x = F.elu(self.dense2(x))
-        x = self.dense3(x)
+        x = self.dense2(x)
 
         log_pi = x.reshape((x.shape[0], x.shape[1]//2,2)).exp()
 
@@ -224,23 +218,86 @@ class GDINADecoder(pl.LightningModule):
         super(GDINADecoder, self).__init__()
 
         # expand the Q matrix so that the columns represent effects instead of attributes
-        self.Q = torch.Tensor(Q)
-        self.Q.requires_grad = False
+        self.Q = torch.cat((torch.ones(Q.shape[0]).unsqueeze(-1), torch.Tensor(Q)), dim=-1)
 
-        self.log_delta = nn.Parameter(torch.rand(self.Q.shape).float())
-        self.intercepts = nn.Parameter(-torch.rand(self.Q.shape[0]).unsqueeze(0))
+        self.Q.requires_grad = False
+        self.mask = self.Q != 0
+
+        self.delta = torch.randn(self.Q.shape[0], self.Q.shape[1], requires_grad=True)
+        #self.deltafixed = torch.ones(self.delta.shape[0], 1, requires_grad=False)
+
+
+
+        #self.intercepts = nn.Parameter(torch.zeros(self.Q.shape[0]).unsqueeze(0))
+        #self.intercepts.requires_grad = False
+        self.link = link
 
         if link == 'logit':
             self.inv_link = nn.Sigmoid()
         elif link == 'log':
             self.inv_link = torch.exp
+        elif link == 'identity':
+            self.inv_link = nn.Identity()
         elif link == 'dina':
             pass
 
+    def constrain_delta(self, delta):
+        #delta = torch.cat((self.deltafixed, self.delta), -1)
+
+        masked_delta = delta.masked_fill(~self.Q.bool(), float('-inf'))
+
+        delta = F.softmax(masked_delta, dim=-1)
+        # Replace masked elements with zero in the final result
+        delta = delta * self.Q
+
+
+
+        #delta /= delta.sum(1, keepdim=True) # constrain sum to one
+
+
+
+        return delta
+
 
     def forward(self, Z) -> torch.Tensor:
-        delta = self.log_delta * self.Q
-        probs = F.sigmoid(Z @ delta.T + self.intercepts)
+
+        Z = torch.cat((torch.ones(Z.shape[1]).repeat(Z.shape[0],1).unsqueeze(-1), Z), dim=-1)
+
+
+        if self.link == 'identity':
+            delta = self.constrain_delta(self.delta)
+        else:
+            delta = self.delta * self.Q
+
+
+        probs = self.inv_link(Z @ delta.T)
+
+        return probs
+
+
+class DINADecoder(pl.LightningModule):
+    def __init__(self,
+                 nitems,
+                 link):
+        """
+        Initialisation
+        :param latent_dims: number of latent dimensions of the model
+        """
+        super(GDINADecoder, self).__init__()
+
+        # expand the Q matrix so that the columns represent effects instead of attributes
+
+        self.log_guess = nn.Parameter(torch.rand(nitems).float())
+        self.log_slip = nn.Parameter(torch.rand(nitems).float())
+
+    def forward(self, Z) -> torch.Tensor:
+        interactions = Z[:, :, -1]
+
+        guess = nn.Sigmoid(self.log_guess)
+        slip = nn.sigmoid(self.log_slip)
+
+        probs = slip * interactions + guess * (1-interactions)
+
 
         return probs
 
@@ -277,19 +334,15 @@ class GDINA(pl.LightningModule):
         logits = logits.repeat(self.n_samples, 1, 1,1)
         probs = F.softmax(logits, dim=-1)
 
-
         att = self.sampler(probs)
         att = att / att.sum(-1, keepdim=True) # make sure probabilities sum to one (sometimes not true due to numerical issues)
         att = att.clamp(1e-5, 1-1e-5)
 
         eff = expand_interactions(att[:, :,:, 0])
-
+        #x_hat = self.decoder(att[:, :, :, 0])
 
         x_hat = self.decoder(eff)
         pi = F.softmax(logits, dim=-1)
-
-
-
 
 
         # logits = self.encoder(X)
@@ -338,20 +391,27 @@ class GDINA(pl.LightningModule):
             loss = (bce + kl_div)
         elif kl_type == 'concrete':
 
+            # pi_att = pi[:, :,(0,1,3), 0] # TODO generalize to any number of attributes
+            # pi_eff_indep = expand_interactions(pi_att)
+            # pi_eff_indep = torch.cat((pi_eff_indep.unsqueeze(-1), 1-pi_eff_indep.unsqueeze(-1)), dim=-1)
+            # log_p_theta = dist.RelaxedOneHotCategorical(torch.Tensor([self.sampler.temperature]),
+            #                                             probs=pi_eff_indep).log_prob(z).sum(-1)
+            #
+            # log_q_theta_x = dist.RelaxedOneHotCategorical(torch.Tensor([self.sampler.temperature]),
+            #                                               probs=pi).log_prob(z).sum(-1)
+
+
             log_p_theta = dist.RelaxedOneHotCategorical(torch.Tensor([self.sampler.temperature]),
                                                         probs=torch.ones_like(pi)).log_prob(z).sum(-1)
+
             log_q_theta_x = dist.RelaxedOneHotCategorical(torch.Tensor([self.sampler.temperature]),
                                                           probs=pi).log_prob(z).sum(-1)
 
 
             kl = (log_q_theta_x - log_p_theta).unsqueeze(-1)  # kl divergence
-            # prior = dist.RelaxedOneHotCategorical(torch.Tensor([self.sampler.temperature]), probs=torch.ones_like(pi))
-            # z_dist = dist.RelaxedOneHotCategorical(torch.Tensor([self.sampler.temperature]), probs=pi)
-            #
-            # kl_div = (z_dist.log_prob(z) - prior.log_prob(z)).sum()
 
 
-            #loss = lll + kl_div
+
             elbo = lll - kl
 
             with torch.no_grad():
@@ -377,24 +437,23 @@ class GDINA(pl.LightningModule):
     def configure_optimizers(self):
         optimizer =  torch.optim.Adam([
                 {'params': self.encoder.parameters(), 'lr': self.lr},
-                {'params': self.decoder.log_delta, 'lr': self.lr},
-                {'params': self.decoder.intercepts, 'lr': self.lr}
+                {'params': self.decoder.delta, 'lr': self.lr}
             ],
             amsgrad=True
         )
-        # Warmup scheduler (linear warmup)
+        #Warmup scheduler (linear warmup)
         warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=self.LR_warmup)
 
-        # Cosine annealing scheduler (after warmup)
-        #annealing_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
+        #Cosine annealing scheduler (after warmup)
+        annealing_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
         annealing_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=self.T_max,
             eta_min=self.LR_min  # Customize as per your use case
-)
+        )
 
 
-        # Combine the schedulers using SequentialLR
+        #Combine the schedulers using SequentialLR
         scheduler = torch.optim.lr_scheduler.SequentialLR(
             optimizer, schedulers=[warmup_scheduler, annealing_scheduler], milestones=[self.LR_warmup]
         )
@@ -416,7 +475,7 @@ class GDINA(pl.LightningModule):
         data = batch
 
         if self.n_samples == 1:
-            mu, _ = self.encoder(data)
+            mu = self.sampler.softmax(self.encoder(data))[:, :, 0]
             return mu.unsqueeze(0)
         else:
 
@@ -443,6 +502,7 @@ class GDINA(pl.LightningModule):
                                       idxs_expanded).squeeze().detach()  # Shape [10000, latent dims]
                 if self.n_attributes == 1:
                     output = output.unsqueeze(-1)
+
                 scores[i, :, :] = output
 
             return scores

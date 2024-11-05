@@ -3,19 +3,19 @@ configs:
   n_items: 400
   #hidden_layer_size: 5
   learning_rate: 0.05
-  lr_warmup_epochs: 200
+  lr_warmup_epochs: 20
   lr_max_epochs: 1000
   lr_min: 0.0001
   single_epoch_test_run: False
-  max_epochs: 2000
+  max_epochs: 1000
   min_epochs: 50
   min_delta: .00008
-  patience: 50
+  patience: 20
   batch_size: 10000
-  n_iw_samples: 25
+  n_iw_samples: 1
   which_data: 'gdina'
   save: False
   iteration : 1
   gumbel_temperature: 1
-  gumbel_decay: .99
+  gumbel_decay: .995
   gumbel_min_temp: .4

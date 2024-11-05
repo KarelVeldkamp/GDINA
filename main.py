@@ -1,3 +1,5 @@
+import random
+
 from torch.utils.data import DataLoader
 from models import *
 from data import *
@@ -38,15 +40,32 @@ Q = (delta != 0).int()
 
 attributes = torch.Tensor(pd.read_csv(f'true/parameters/att_{cfg["iteration"]}_{cfg["which_data"]}.csv', index_col=0).values)
 
-data = torch.Tensor(pd.read_csv(f'true/data/data_{cfg["iteration"]}_{cfg["which_data"]}.csv', index_col=0).values)
+
+simulate = False
+if simulate:
+    p = torch.Tensor([.5, .5, .5]).repeat(10000,1)
+    bernoulli_dist = torch.distributions.Bernoulli(probs=p)
+
+    # Sample from the distribution
+    sample = bernoulli_dist.sample()
+    delta = delta
+    probs = F.sigmoid(expand_interactions(attributes).squeeze() @ delta.T + intercepts)
+    data = probs > torch.rand(size=probs.shape)
+    data = data.float()
+else:
+    data = torch.Tensor(pd.read_csv(f'true/data/data_{cfg["iteration"]}_{cfg["which_data"]}.csv', index_col=0).values)
+
 n_items = data.shape[1]
 n_attributes = int(np.log2(Q.shape[1]+1))
+
+
+
 
 
 if cfg['which_data'] == 'llm':
     link='logit'
 elif cfg['which_data'] == 'gdina':
-    link='logit'
+    link='identity'
 elif cfg['which_data'] == 'dina':
     link='dina'
 elif cfg['which_data'] == 'rrum':
@@ -75,8 +94,8 @@ model = GDINA(dataloader=train_loader,
              n_iw_samples=cfg['n_iw_samples']
              )
 
-
 model.to(device)
+
 
 
 if os.path.exists('logs/all/version_0/metrics.csv'):
@@ -84,7 +103,7 @@ if os.path.exists('logs/all/version_0/metrics.csv'):
 
 
 logger = CSVLogger("logs", name='all', version=0)
-trainer = Trainer(fast_dev_run=cfg['single_epoch_test_run'],
+trainer1 = Trainer(fast_dev_run=cfg['single_epoch_test_run'],
                   max_epochs=cfg['max_epochs'],
                   min_epochs=cfg['min_epochs'],
                   logger=logger,
@@ -95,7 +114,32 @@ trainer = Trainer(fast_dev_run=cfg['single_epoch_test_run'],
                   detect_anomaly=False)
 start = time.time()
 
-trainer.fit(model)
+
+
+trainer1.fit(model)
+
+if False:
+    for p in model.encoder.parameters():
+        p.requires_grad = False
+
+    model.sampler.temperature = 1e-7
+    model.sampler.sample = False
+    model.min_temp = 1e-7
+
+    trainer2 = Trainer(
+        fast_dev_run=cfg['single_epoch_test_run'],
+        max_epochs=2000,
+        min_epochs=10,
+        logger=logger,
+        callbacks=[
+            EarlyStopping(monitor='train_loss', min_delta=cfg['min_delta'], patience=2000, mode='min')
+        ],
+        accelerator=device.type,
+        detect_anomaly=False
+    )
+
+    trainer2.fit(model)
+
 runtime = time.time() - start
 
 print(f'runtime: {runtime}')
@@ -106,9 +150,10 @@ test_data = next(iter(test_loader))
 
 #pred_class = (model.encoder(test_data) > .5).float().detach().numpy()
 pred_class = (model.fscores(test_data).mean(0) > .5).float().detach().numpy()
+#pred_class = pred_class[:, (0,1,3)]
 
-print(expand_interactions(model.fscores(test_data).mean(0)).mean(1))
-print(np.rint(expand_interactions(model.fscores(test_data).mean(0))).mean(1))
+#print(expand_interactions(model.fscores(test_data).mean(0)).mean(1))
+#print(np.rint(expand_interactions(model.fscores(test_data).mean(0))).mean(1))
 
 
 print(f'temperature: {model.sampler.temperature}')
@@ -116,15 +161,21 @@ print(f'temperature: {model.sampler.temperature}')
 
 
 #acc = (expand_interactions(attributes).detach().numpy()==pred_class).mean()
-acc = (attributes.detach().numpy()==pred_class).mean()
-
+acc = (attributes.detach().numpy()==pred_class).mean(0)
+print(attributes.mean(0))
+print(pred_class.mean(0))
 print(f'accruracy: {acc}')
 
 
 
+if model.decoder.link == 'identity':
+    # Replace masked elements with zero in the final result
+    est_delta = model.decoder.constrain_delta(model.decoder.delta).detach().numpy()
+else:
+    est_delta = (model.decoder.delta * model.decoder.Q).detach().numpy()
 
-est_delta = (model.decoder.log_delta * model.decoder.Q).detach().numpy()
-est_intercepts = model.decoder.intercepts.detach().numpy()
+est_intercepts = est_delta[:,0]
+est_delta = est_delta[:,1:est_delta.shape[1]]
 
 delta = delta.detach().numpy()
 
@@ -149,16 +200,17 @@ else:
         os.remove(plot)
 
     for effect in range(0,n_effects-1):
-        plt.figure()
-        mse = MSE(est_delta[:,effect], delta[:,effect])
-        plt.scatter(y=est_delta[:,effect], x=delta[:,effect])
-        plt.plot(delta[:,effect], delta[:,effect])
-        # for i, x in enumerate(ai_true):
-        #    plt.text(ai_true[i], ai_est[i], i)
-        plt.title(f'Parameter estimation plot: delta {effect + 1}, MSE={round(mse, 4)}')
-        plt.xlabel('True values')
-        plt.ylabel('Estimates')
-        plt.savefig(f'./figures/simfit/{cfg["which_data"]}/param_est_plot_delta{effect + 1}.png')
+        if np.sum(est_delta[:,effect] > 0) > 0:
+            plt.figure()
+            mse = MSE(est_delta[:,effect], delta[:,effect])
+            plt.scatter(y=est_delta[:,effect], x=delta[:,effect])
+            plt.plot(delta[:,effect], delta[:,effect])
+            # for i, x in enumerate(ai_true):
+            #    plt.text(ai_true[i], ai_est[i], i)
+            plt.title(f'Parameter estimation plot: delta {effect + 1}, MSE={round(mse, 4)}')
+            plt.xlabel('True values')
+            plt.ylabel('Estimates')
+            plt.savefig(f'./figures/simfit/{cfg["which_data"]}/param_est_plot_delta{effect + 1}.png')
 
     plt.figure()
     mse = MSE(est_delta[delta!=0], delta[delta!=0])
